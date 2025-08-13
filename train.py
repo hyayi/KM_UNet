@@ -406,15 +406,20 @@ def main():
         batch_size=config['batch_size'],
         shuffle=True,
         num_workers=config['num_workers'],
-        drop_last=True
-    )
-
+        drop_last=True,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True 
+    ) 
     val_loader = torch.utils.data.DataLoader(
-        val_dataset,
+        train_dataset,
         batch_size=config['batch_size'],
         shuffle=False,
         num_workers=config['num_workers'],
-        drop_last=False
+        drop_last=False,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True 
     )
 
     log = OrderedDict([
