@@ -12,10 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 import yaml
 
-from albumentations.augmentations import transforms
-from albumentations.augmentations import geometric
-from albumentations import HorizontalFlip, RandomRotate90, Resize, Compose  # 直接导入需要的类
-from albumentations.core.composition import Compose, OneOf
+import albumentations as A
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 from albumentations import RandomRotate90, Resize
@@ -57,7 +54,7 @@ def parse_args():
                         help='model name: (default: arch+timestamp)')
     parser.add_argument('--epochs', default=400, type=int, metavar='N',
                         help='number of total epochs to run')
-    parser.add_argument('-b', '--batch_size', default=16, type=int,
+    parser.add_argument('-b', '--batch_size', default=2, type=int,
                         metavar='N', help='mini-batch size (default: 16)')
 
     parser.add_argument('--dataseed', default=2981, type=int,
@@ -372,16 +369,16 @@ def main():
         train_img_ids = splits[0]["train"]
         val_img_ids = splits[0]["val"]
 
-    train_transform = Compose([
-        RandomRotate90(),
-        HorizontalFlip(),  # 替换弃用的 Flip()
-        Resize(config['input_h'], config['input_w']),
-        transforms.Normalize(),
+    train_transform = A.Compose([
+        A.RandomRotate90(),
+        A.HorizontalFlip(),  # 기존 Flip() 대신 HorizontalFlip()
+        A.Resize(config['input_h'], config['input_w']),
+        A.Normalize(),  # 기본값: mean=(0,0,0), std=(1,1,1)
     ])
 
-    val_transform = Compose([
-        Resize(config['input_h'], config['input_w']),
-        transforms.Normalize(),
+    val_transform = A.Compose([
+        A.Resize(config['input_h'], config['input_w']),
+        A.Normalize(),
     ])
 
     train_dataset = Dataset(
