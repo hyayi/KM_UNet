@@ -408,7 +408,7 @@ def main():
         num_workers=config['num_workers'],
         drop_last=True,
         pin_memory=True,
-        prefetch_factor=2,
+        prefetch_factor=4,
         persistent_workers=True 
     ) 
     val_loader = torch.utils.data.DataLoader(
@@ -418,7 +418,7 @@ def main():
         num_workers=config['num_workers'],
         drop_last=False,
         pin_memory=True,
-        prefetch_factor=2,
+        prefetch_factor=4,
         persistent_workers=True 
     )
 
