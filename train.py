@@ -16,7 +16,6 @@ from albumentations.augmentations import transforms
 from albumentations.augmentations import geometric
 from albumentations import HorizontalFlip, RandomRotate90, Resize, Compose  # 直接导入需要的类
 from albumentations.core.composition import Compose, OneOf
-from sklearn.model_selection import train_test_split
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 from albumentations import RandomRotate90, Resize
@@ -37,6 +36,7 @@ import os
 import subprocess
 
 from pdb import set_trace as st
+import json
 
 
 ARCH_NAMES = archs.__all__
@@ -57,7 +57,7 @@ def parse_args():
                         help='model name: (default: arch+timestamp)')
     parser.add_argument('--epochs', default=400, type=int, metavar='N',
                         help='number of total epochs to run')
-    parser.add_argument('-b', '--batch_size', default=8, type=int,
+    parser.add_argument('-b', '--batch_size', default=2, type=int,
                         metavar='N', help='mini-batch size (default: 16)')
 
     parser.add_argument('--dataseed', default=2981, type=int,
@@ -86,7 +86,9 @@ def parse_args():
     
     # dataset
     parser.add_argument('--dataset', default='busi', help='dataset name')      
-    parser.add_argument('--data_dir', default='inputs', help='dataset dir')
+    parser.add_argument('--image_dir', help='img dir')
+    parser.add_argument('--mask_dir',  help='mask dir')
+    parser.add_argument('--splits_final',type=str, help='data splits')
 
     parser.add_argument('--output_dir', default='outputs', help='ouput dir')
 
@@ -245,7 +247,7 @@ def main():
 
     # 设置数据集特定参数
     dataset_name = config['dataset']
-    img_ext = '.png'
+    img_ext = '_0000.nii.gz'
     mask_ext = '.png'  # 默认值
     if dataset_name == 'busi':
         mask_ext = '_mask.png'
@@ -257,6 +259,8 @@ def main():
         mask_ext = '.png'
     elif dataset_name == 'isic2017':
         mask_ext = '.png'    
+    elif dataset_name == "ngtube":
+        mask_ext = ".nii.gz"
     else:
         mask_ext = '.png'  # 默认值
 
@@ -360,19 +364,13 @@ def main():
     shutil.copy2('archs.py', f'{output_dir}/{exp_name}/')
 
     # Data loading code
-    img_dir = os.path.join(config['data_dir'], config['dataset'], 'images')
-    mask_dir = os.path.join(config['data_dir'], config['dataset'], 'masks')
+    img_dir = config['image_dir']
+    mask_dir =config['mask_dir']
 
-    img_ids = sorted(glob(os.path.join(img_dir, '*' + img_ext)))
-    img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
-
-    print(f"Loaded {len(img_ids)} images from {img_dir}")
-    
-    train_img_ids, val_img_ids = train_test_split(
-        img_ids,
-        test_size=0.2,
-        random_state=config['dataseed']
-    )
+    with open(config["splits_final"]) as f:
+        splits =json.load(f)
+        train_img_ids = splits[0]["train"]
+        val_img_ids = splits[0]["val"]
 
     train_transform = Compose([
         RandomRotate90(),

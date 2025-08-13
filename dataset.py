@@ -4,10 +4,11 @@ import cv2
 import numpy as np
 import torch
 import torch.utils.data
-
-
+import nibabel as nib
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, img_ids, img_dir, mask_dir, img_ext, mask_ext, num_classes, transform=None):
+    def __init__(self,img_ids,img_dir, mask_dir, img_ext, mask_ext, num_classes, transform=None):
         """
         Args:
             img_ids (list): Image ids.
@@ -41,13 +42,12 @@ class Dataset(torch.utils.data.Dataset):
                 |   ├── ...
                 ...
         """
-        self.img_ids = img_ids
         self.img_dir = img_dir
         self.mask_dir = mask_dir
         self.img_ext = img_ext
         self.mask_ext = mask_ext
-        self.num_classes = num_classes
         self.transform = transform
+        self.img_ids = img_ids
 
     def __len__(self):
         return len(self.img_ids)
@@ -56,14 +56,13 @@ class Dataset(torch.utils.data.Dataset):
         img_id = self.img_ids[idx]
 
         # 读取图像
-        img = cv2.imread(os.path.join(self.img_dir, img_id + self.img_ext))
-
+        img = nib.load(os.path.join(self.img_dir, img_id + self.img_ext)).get_fdata()[:,:,0]
+        img = img.astype('uint8')
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        
         # 读取掩码
-        mask = []
-        for i in range(self.num_classes):
-            mask.append(cv2.imread(os.path.join(self.mask_dir, str(i),
-                        img_id + self.mask_ext), cv2.IMREAD_GRAYSCALE)[..., None])
-        mask = np.dstack(mask)
+        mask = nib.load(os.path.join(self.mask_dir, img_id + self.mask_ext)).get_fdata()[:,:]
+        mask = mask.astype('uint8')
 
         # 如果使用了数据增强，则应用变换
         if self.transform is not None:
