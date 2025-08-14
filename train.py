@@ -486,8 +486,6 @@ def main():
         if config['early_stopping'] >= 0 and trigger >= config['early_stopping']:
             print("=> early stopping")
             break
-
-        torch.cuda.empty_cache()
     
 if __name__ == '__main__':
     main()
