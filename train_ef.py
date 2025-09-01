@@ -1,3 +1,5 @@
+# train.py  (AMP 없음 + Resume 통합 버전)
+
 import argparse, os, random, json, shutil, yaml
 from collections import OrderedDict
 import numpy as np, pandas as pd
@@ -17,67 +19,17 @@ from utils import AverageMeter, str2bool
 from tensorboardX import SummaryWriter
 
 
-def list_type(s): return [int(a) for a in s.split(',')]
+# ------------------------- Utils -------------------------
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    # --- basics ---
-    p.add_argument('--name', default=None)
-    p.add_argument('--epochs', default=400, type=int)
-    p.add_argument('-b', '--batch_size', default=16, type=int)
-    p.add_argument('--num_workers', default=4, type=int)
-    p.add_argument('--output_dir', default='outputs')
-
-    # --- data ---
-    p.add_argument('--dataset', default='busi')
-    p.add_argument('--image_dir', required=True)
-    p.add_argument('--mask_dir',  required=True)
-    p.add_argument('--splits_final', type=str, required=True)
-
-    # --- model ---
-    p.add_argument('--arch', default='UKAN')
-    p.add_argument('--deep_supervision', default=False, type=str2bool)
-    p.add_argument('--input_channels', default=3, type=int)
-    p.add_argument('--num_classes', default=1, type=int)
-    p.add_argument('--input_w', default=256, type=int)
-    p.add_argument('--input_h', default=256, type=int)
-    p.add_argument('--input_list', type=list_type, default=[128,160,256])
-    p.add_argument('--no_kan', action='store_true')
-
-    # --- loss ---
-    LOSS_NAMES = losses.__all__ + ['BCEWithLogitsLoss']
-    p.add_argument('--loss', default='BCEDiceLoss', choices=LOSS_NAMES)
-
-    # --- optim ---
-    p.add_argument('--optimizer', default='Adam', choices=['Adam','SGD'])
-    p.add_argument('--lr', default=1e-4, type=float)
-    p.add_argument('--weight_decay', default=1e-4, type=float)
-    p.add_argument('--momentum', default=0.9, type=float)
-    p.add_argument('--nesterov', default=False, type=str2bool)
-
-    # KAN 전용 하이퍼
-    p.add_argument('--kan_lr', default=1e-2, type=float)
-    p.add_argument('--kan_weight_decay', default=1e-4, type=float)
-
-    # --- scheduler ---
-    p.add_argument('--scheduler', default='CosineAnnealingLR',
-                   choices=['CosineAnnealingLR','ReduceLROnPlateau','MultiStepLR','ConstantLR'])
-    p.add_argument('--min_lr', default=1e-5, type=float)
-    p.add_argument('--factor', default=0.1, type=float)
-    p.add_argument('--patience', default=2, type=int)
-    p.add_argument('--milestones', default='1,2', type=str)
-    p.add_argument('--gamma', default=2/3, type=float)
-    p.add_argument('--early_stopping', default=-1, type=int)
-
-    return p.parse_args()
-
+def list_type(s): 
+    return [int(a) for a in s.split(',')]
 
 def seed_all(seed=1029):
     random.seed(seed); os.environ['PYTHONHASHSEED']=str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-    # 입력 크기 고정 시 autotuner로 가속, 변동 크기면 False 권장
-    cudnn.benchmark = True   # 고정 256x256이면 보통 이득. :contentReference[oaicite:1]{index=1}
+    # 고정 크기 입력(예: 256x256)일 때 주로 유리
+    cudnn.benchmark = True      # faster conv algos after warmup  (참고: PyTorch docs)
     cudnn.deterministic = False
 
 
@@ -86,6 +38,38 @@ def build_criterion(name):
         return nn.BCEWithLogitsLoss().cuda()
     return losses.__dict__[name]().cuda()
 
+
+def save_ckpt(path, model, optimizer, scheduler, epoch, best_iou, best_dice, config):
+    ckpt = {
+        'epoch': epoch,
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict() if optimizer is not None else None,
+        'scheduler': scheduler.state_dict() if scheduler is not None else None,
+        'best_iou': best_iou,
+        'best_dice': best_dice,
+        'config': config,
+    }
+    torch.save(ckpt, path)
+
+
+def load_ckpt(path, model, optimizer=None, scheduler=None, strict=True):
+    ckpt = torch.load(path, map_location='cuda')
+    state = ckpt.get('model') or ckpt.get('state_dict') or ckpt
+    # DataParallel/DDP로 저장된 경우 키 정리
+    if any(k.startswith('module.') for k in state.keys()):
+        state = {k.replace('module.', '', 1): v for k, v in state.items()}
+    model.load_state_dict(state, strict=strict)
+    if optimizer is not None and isinstance(ckpt.get('optimizer'), dict):
+        optimizer.load_state_dict(ckpt['optimizer'])
+    if scheduler is not None and isinstance(ckpt.get('scheduler'), dict):
+        scheduler.load_state_dict(ckpt['scheduler'])
+    start_epoch = int(ckpt.get('epoch', 0)) + 1
+    best_iou = float(ckpt.get('best_iou', 0.0))
+    best_dice = float(ckpt.get('best_dice', 0.0))
+    return start_epoch, best_iou, best_dice
+
+
+# ------------------------- Data -------------------------
 
 def make_dataloaders(cfg, img_ext='_0000.nii.gz', mask_ext='.png'):
     # 데이터셋별 마스크 확장자
@@ -120,9 +104,11 @@ def make_dataloaders(cfg, img_ext='_0000.nii.gz', mask_ext='.png'):
 
     dl_common = dict(batch_size=cfg['batch_size'], pin_memory=True)
     if cfg['num_workers'] > 0:
-        dl_common.update(dict(num_workers=cfg['num_workers'],
-                              persistent_workers=True,  # 에폭간 워커 유지로 시작 지연 감소 :contentReference[oaicite:2]{index=2}
-                              prefetch_factor=8))        # 워커당 미리 적재 수 (기본 2) :contentReference[oaicite:3]{index=3}
+        dl_common.update(dict(
+            num_workers=cfg['num_workers'],
+            persistent_workers=True,   # 에폭 간 워커 유지
+            prefetch_factor=8          # 워커당 미리 적재 샘플 수
+        ))
     else:
         dl_common.update(dict(num_workers=0))
 
@@ -130,21 +116,23 @@ def make_dataloaders(cfg, img_ext='_0000.nii.gz', mask_ext='.png'):
         train_ds, shuffle=True, drop_last=True, **dl_common
     )
     val_loader = torch.utils.data.DataLoader(
-        val_ds,   shuffle=False, drop_last=False, **dl_common  # ⚠️ 검증은 val_ds 사용(버그 수정)
+        val_ds,   shuffle=False, drop_last=False, **dl_common   # ⚠️ val_ds 사용
     )
     return train_loader, val_loader
 
 
+# ------------------------- Optim/Sched -------------------------
+
 def build_optimizer(cfg, model):
-    # 파라미터 그룹 2개만(kan vs 기타) → 수천 그룹 생성 오버헤드 방지
+    # 파라미터 그룹 2개(kan vs others)만 생성
     kan_params, base_params = [], []
     for n, p in model.named_parameters():
-        if not p.requires_grad: continue
+        if not p.requires_grad: 
+            continue
         if ('layer' in n.lower()) and ('fc' in n.lower()):
             kan_params.append(p)
         else:
             base_params.append(p)
-
     groups = [
         {'params': base_params, 'lr': cfg['lr'],     'weight_decay': cfg['weight_decay']},
         {'params': kan_params,  'lr': cfg['kan_lr'], 'weight_decay': cfg['kan_weight_decay']},
@@ -169,14 +157,15 @@ def build_scheduler(cfg, optimizer):
     raise NotImplementedError
 
 
+# ------------------------- Train/Valid -------------------------
+
 def train_one_epoch(cfg, loader, model, criterion, optimizer):
     avg = {'loss': AverageMeter(), 'iou': AverageMeter()}
     model.train()
     pbar = tqdm(total=len(loader))
     for x, y, _ in loader:
         x = x.cuda(non_blocking=True); y = y.cuda(non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)  # 메모리/성능에 유리 :contentReference[oaicite:4]{index=4}
+        optimizer.zero_grad(set_to_none=True)  # 메모리↓, 약간의 속도↑
         out = model(x)
         loss = criterion(out, y)
         loss.backward()
@@ -185,9 +174,7 @@ def train_one_epoch(cfg, loader, model, criterion, optimizer):
         iou, dice, _ = iou_score(out, y)
         avg['loss'].update(loss.item(), x.size(0))
         avg['iou'].update(iou, x.size(0))
-
-        pbar.set_postfix(OrderedDict(loss=avg['loss'].avg, iou=avg['iou'].avg))
-        pbar.update(1)
+        pbar.set_postfix(OrderedDict(loss=avg['loss'].avg, iou=avg['iou'].avg)); pbar.update(1)
     pbar.close()
     return OrderedDict(loss=avg['loss'].avg, iou=avg['iou'].avg)
 
@@ -205,16 +192,80 @@ def validate_one_epoch(cfg, loader, model, criterion):
         avg['loss'].update(loss.item(), x.size(0))
         avg['iou'].update(iou, x.size(0))
         avg['dice'].update(dice, x.size(0))
-        pbar.set_postfix(OrderedDict(loss=avg['loss'].avg, iou=avg['iou'].avg, dice=avg['dice'].avg))
-        pbar.update(1)
+        pbar.set_postfix(OrderedDict(loss=avg['loss'].avg, iou=avg['iou'].avg, dice=avg['dice'].avg)); pbar.update(1)
     pbar.close()
     return OrderedDict(loss=avg['loss'].avg, iou=avg['iou'].avg, dice=avg['dice'].avg)
 
 
+# ------------------------- Args -------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser()
+
+    # basics
+    p.add_argument('--name', default=None)
+    p.add_argument('--epochs', default=400, type=int)
+    p.add_argument('-b', '--batch_size', default=16, type=int)
+    p.add_argument('--num_workers', default=4, type=int)
+    p.add_argument('--output_dir', default='outputs')
+
+    # data
+    p.add_argument('--dataset', default='busi')
+    p.add_argument('--image_dir', required=True)
+    p.add_argument('--mask_dir',  required=True)
+    p.add_argument('--splits_final', type=str, required=True)
+
+    # model
+    p.add_argument('--arch', default='UKAN')
+    p.add_argument('--deep_supervision', default=False, type=str2bool)
+    p.add_argument('--input_channels', default=3, type=int)
+    p.add_argument('--num_classes', default=1, type=int)
+    p.add_argument('--input_w', default=256, type=int)
+    p.add_argument('--input_h', default=256, type=int)
+    p.add_argument('--input_list', type=list_type, default=[128,160,256])
+    p.add_argument('--no_kan', action='store_true')
+
+    # loss
+    LOSS_NAMES = losses.__all__ + ['BCEWithLogitsLoss']
+    p.add_argument('--loss', default='BCEDiceLoss', choices=LOSS_NAMES)
+
+    # optim
+    p.add_argument('--optimizer', default='Adam', choices=['Adam','SGD'])
+    p.add_argument('--lr', default=1e-4, type=float)
+    p.add_argument('--weight_decay', default=1e-4, type=float)
+    p.add_argument('--momentum', default=0.9, type=float)
+    p.add_argument('--nesterov', default=False, type=str2bool)
+    p.add_argument('--kan_lr', default=1e-2, type=float)
+    p.add_argument('--kan_weight_decay', default=1e-4, type=float)
+
+    # scheduler
+    p.add_argument('--scheduler', default='CosineAnnealingLR',
+                   choices=['CosineAnnealingLR','ReduceLROnPlateau','MultiStepLR','ConstantLR'])
+    p.add_argument('--min_lr', default=1e-5, type=float)
+    p.add_argument('--factor', default=0.1, type=float)
+    p.add_argument('--patience', default=2, type=int)
+    p.add_argument('--milestones', default='1,2', type=str)
+    p.add_argument('--gamma', default=2/3, type=float)
+    p.add_argument('--early_stopping', default=-1, type=int)
+
+    # resume
+    p.add_argument('--resume', type=str, default='',
+                   help='checkpoint(.pth/.pt/.tar) 경로. 비우면 신규 학습')
+    p.add_argument('--resume_strict', type=str2bool, default=True,
+                   help='state_dict strict 로딩 여부')
+    p.add_argument('--resume_optim', type=str2bool, default=True,
+                   help='optimizer 상태 복원')
+    p.add_argument('--resume_sched', type=str2bool, default=True,
+                   help='scheduler 상태 복원')
+
+    return p.parse_args()
+
+
+# ------------------------- Main -------------------------
+
 def main():
     seed_all()
-    cfg_ns = parse_args()
-    cfg = vars(cfg_ns)
+    cfg = vars(parse_args())
 
     # 실험 폴더
     if cfg['name'] is None:
@@ -244,10 +295,24 @@ def main():
         if os.path.exists(fname):
             shutil.copy2(fname, save_dir)
 
-    log = OrderedDict(epoch=[], lr=[], loss=[], iou=[], val_loss=[], val_iou=[], val_dice=[])
-    best_iou, best_dice, trigger = 0.0, 0.0, 0
+    # --------- Resume ---------
+    start_epoch, best_iou, best_dice = 0, 0.0, 0.0
+    if cfg['resume']:
+        start_epoch, best_iou, best_dice = load_ckpt(
+            cfg['resume'],
+            model,
+            optimizer if cfg['resume_optim'] else None,
+            scheduler if (cfg['resume_sched'] and scheduler is not None) else None,
+            strict=cfg['resume_strict']
+        )
+        print(f"=> resumed from {cfg['resume']} | start_epoch={start_epoch} | "
+              f"best_iou={best_iou:.4f} | best_dice={best_dice:.4f}")
 
-    for epoch in range(cfg['epochs']):
+    # --------- Train Loop ---------
+    log = OrderedDict(epoch=[], lr=[], loss=[], iou=[], val_loss=[], val_iou=[], val_dice=[])
+    trigger = 0
+
+    for epoch in range(start_epoch, cfg['epochs']):
         print(f"Epoch [{epoch}/{cfg['epochs']}]")
 
         tr = train_one_epoch(cfg, train_loader, model, criterion, optimizer)
@@ -259,7 +324,7 @@ def main():
             else:
                 scheduler.step()
 
-        # 로그
+        # 로깅
         current_lrs = [pg['lr'] for pg in optimizer.param_groups]
         log['epoch'].append(epoch); log['lr'].append(current_lrs)
         log['loss'].append(tr['loss']); log['iou'].append(tr['iou'])
@@ -274,14 +339,17 @@ def main():
         tb.add_scalar('val/best_iou_value',  best_iou, epoch)
         tb.add_scalar('val/best_dice_value', best_dice, epoch)
 
-        # 베스트 저장
+        # 체크포인트: last/베스트
+        save_ckpt(os.path.join(save_dir, 'last.pth'),
+                  model, optimizer, scheduler, epoch, best_iou, best_dice, cfg)
+
         trigger += 1
         if va['iou'] > best_iou:
             best_iou, best_dice, trigger = va['iou'], va['dice'], 0
-            torch.save(model.state_dict(), os.path.join(save_dir, 'model.pth'))
-            print("=> saved best model | IoU=%.4f | Dice=%.4f" % (best_iou, best_dice))
+            save_ckpt(os.path.join(save_dir, 'best.pth'),
+                      model, optimizer, scheduler, epoch, best_iou, best_dice, cfg)
+            print("=> saved BEST checkpoint | IoU=%.4f | Dice=%.4f" % (best_iou, best_dice))
 
-        # early stopping
         if cfg['early_stopping'] >= 0 and trigger >= cfg['early_stopping']:
             print("=> early stopping")
             break
