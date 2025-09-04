@@ -116,7 +116,7 @@ def make_dataloaders(cfg, img_ext='_0000.nii.gz', mask_ext='.png'):
         train_ds, shuffle=True, drop_last=True, **dl_common
     )
     val_loader = torch.utils.data.DataLoader(
-        val_ds,   shuffle=False, drop_last=False, **dl_common   # ⚠️ val_ds 사용
+        val_ds,   shuffle=False, drop_last=False, **dl_common   
     )
     return train_loader, val_loader
 
