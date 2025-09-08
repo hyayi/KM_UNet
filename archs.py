@@ -688,7 +688,7 @@ class UKAN(nn.Module):
 
     def forward(self, x):
 
-        print(f"Input shape: {x.shape}")
+        # print(f"Input shape: {x.shape}")
         B = x.shape[0]
 
         ### Encoder
@@ -727,7 +727,7 @@ class UKAN(nn.Module):
         ### Bottleneck
 
         out, H, W = self.patch_embed4(out)
-        print(f"After Bottleneck (patch_embed4) shape: {out.shape}, H: {H}, W: {W}")
+        # print(f"After Bottleneck (patch_embed4) shape: {out.shape}, H: {H}, W: {W}")
         for i, blk in enumerate(self.block2):
             out = blk(out, H, W)
         out = self.norm4(out)
