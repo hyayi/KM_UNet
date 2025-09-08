@@ -10,9 +10,9 @@ def iou_score(output, target):
     smooth = 1e-5
 
     if torch.is_tensor(output):
-        output = torch.sigmoid(output).data.cpu().numpy()
+        output = torch.sigmoid(output).detach().to(torch.float32).cpu().numpy()
     if torch.is_tensor(target):
-        target = target.data.cpu().numpy()
+        target = target.detach().to(torch.float32).cpu().numpy()
     output_ = output > 0.5
     target_ = target > 0.5
     intersection = (output_ & target_).sum()
